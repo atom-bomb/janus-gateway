@@ -652,6 +652,18 @@ rtspiface = network interface IP address or device name to listen on when receiv
 #include <curl/curl.h>
 #endif
 
+#ifdef HAVE_LIBPULSE
+#include <opus/opus.h>
+#include <pulse/simple.h>
+#include <pulse/error.h>
+
+/* Opus settings */		
+#define	BUFFER_SAMPLES	8000
+#define	OPUS_SAMPLES	160
+#define USE_FEC			0
+#define DEFAULT_COMPLEXITY	4
+#endif
+
 #include "../debug.h"
 #include "../apierror.h"
 #include "../config.h"
@@ -801,7 +813,8 @@ static struct janus_json_parameter rtsp_parameters[] = {
 	{"videortpmap", JSON_STRING, 0},
 	{"videofmtp", JSON_STRING, 0},
 	{"rtspiface", JSON_STRING, 0},
-	{"rtsp_failcheck", JANUS_JSON_BOOL, 0}
+	{"rtsp_failcheck", JANUS_JSON_BOOL, 0},
+	{"pulse_sink", JSON_STRING, 0}
 };
 #endif
 static struct janus_json_parameter rtp_audio_parameters[] = {
@@ -944,6 +957,14 @@ typedef struct janus_streaming_rtp_source {
 	int audio_rtcp_fd;
 	int video_rtcp_fd;
 #endif
+#ifdef HAVE_LIBPULSE
+	gboolean play_audio;
+	char *pa_sink;
+	pa_simple *pa_s;
+	OpusDecoder *opus_decoder;
+	opus_int16 *pcm_data;
+	int pcm_length;
+#endif
 	janus_streaming_rtp_keyframe keyframe;
 	gboolean buffermsg;
 	int rtp_collision;
@@ -1027,7 +1048,12 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		gboolean doaudio, char *artpmap, char *afmtp,
 		gboolean dovideo, char *vrtpmap, char *vfmtp,
 		const janus_network_address *iface,
+#ifdef HAVE_LIBPULSE
+		gboolean error_on_failure,
+		char *pa_sink);
+#else
 		gboolean error_on_failure);
+#endif
 
 
 typedef struct janus_streaming_message {
@@ -1567,6 +1593,9 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 				janus_config_item *vfmtp = janus_config_get_item(cat, "videofmtp");
 				janus_config_item *iface = janus_config_get_item(cat, "rtspiface");
 				janus_config_item *failerr = janus_config_get_item(cat, "rtsp_failcheck");
+#ifdef HAVE_LIBPULSE
+				janus_config_item *pa_sink = janus_config_get_item(cat, "pulse_sink");
+#endif
 				janus_network_address iface_value;
 				if(file == NULL || file->value == NULL) {
 					JANUS_LOG(LOG_ERR, "Can't add 'rtsp' stream '%s', missing mandatory information...\n", cat->name);
@@ -1621,7 +1650,12 @@ int janus_streaming_init(janus_callbacks *callback, const char *config_path) {
 						vrtpmap ? (char *)vrtpmap->value : NULL,
 						vfmtp ? (char *)vfmtp->value : NULL,
 						iface && iface->value ? &iface_value : NULL,
+#ifdef HAVE_LIBPULSE
+						error_on_failure,
+						pa_sink ? (char *)pa_sink->value : NULL)) == NULL) {
+#else
 						error_on_failure)) == NULL) {
+#endif
 					JANUS_LOG(LOG_ERR, "Error creating 'rtsp' stream '%s'...\n", cat->name);
 					cl = cl->next;
 					continue;
@@ -2415,6 +2449,9 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 			json_t *password = json_object_get(root, "rtsp_pwd");
 			json_t *iface = json_object_get(root, "rtspiface");
 			json_t *failerr = json_object_get(root, "rtsp_check");
+#ifdef HAVE_LIBPULSE
+			json_t *pa_sink = json_object_get(root, "pulse_sink");
+#endif
 			gboolean doaudio = audio ? json_is_true(audio) : FALSE;
 			gboolean dovideo = video ? json_is_true(video) : FALSE;
 			gboolean error_on_failure = failerr ? json_is_true(failerr) : TRUE;
@@ -2446,7 +2483,12 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 					doaudio, (char *)json_string_value(audiortpmap), (char *)json_string_value(audiofmtp),
 					dovideo, (char *)json_string_value(videortpmap), (char *)json_string_value(videofmtp),
 					&multicast_iface,
+#ifdef HAVE_LIBPULSE
+					error_on_failure,
+					pa_sink ? (char *)json_string_value(pa_sink) : NULL);
+#else
 					error_on_failure);
+#endif
 			if(mp == NULL) {
 				JANUS_LOG(LOG_ERR, "Error creating 'rtsp' stream...\n");
 				error_code = JANUS_STREAMING_ERROR_CANT_CREATE;
@@ -2585,6 +2627,11 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 				json_t *iface = json_object_get(root, "rtspiface");
 				if(iface)
 					janus_config_add_item(config, mp->name, "rtspiface", json_string_value(iface));
+#ifdef HAVE_LIBPULSE
+				json_t *pa_sink = json_object_get(root, "pulse_sink");
+				if(pa_sink)
+					janus_config_add_item(config, mp->name, "pulse_sink", json_string_value(pa_sink));
+#endif
 			}
 			/* Some more common values */
 			if(mp->secret)
@@ -3346,6 +3393,34 @@ void janus_streaming_setup_media(janus_plugin_session *handle) {
 void janus_streaming_incoming_rtp(janus_plugin_session *handle, int video, char *buf, int len) {
 	if(handle == NULL || g_atomic_int_get(&handle->stopped) || g_atomic_int_get(&stopping) || !g_atomic_int_get(&initialized))
 		return;
+#if HAVE_LIBPULSE
+	janus_streaming_session *session = (janus_streaming_session *)handle->plugin_handle;	
+	if(!session || session->destroyed || session->stopping || !session->started || session->paused)
+		return;
+	janus_streaming_mountpoint *mp = (janus_streaming_mountpoint *)session->mountpoint;
+	if(mp->streaming_source != janus_streaming_source_rtp)
+		return;
+	janus_streaming_rtp_source *ss = (janus_streaming_rtp_source *)mp->source;
+	if(!ss->play_audio)
+		return;
+
+	int plen = 0;
+	const unsigned char *payload = (const unsigned char *)janus_rtp_payload(buf, len, &plen);
+	if(!payload) {
+		JANUS_LOG(LOG_ERR, "Ops! got an error accessing the RTP payload\n");
+		return;
+	}
+	ss->pcm_length = opus_decode(ss->opus_decoder, payload, plen, (opus_int16 *)ss->pcm_data, BUFFER_SAMPLES, USE_FEC);
+	if(ss->pcm_length < 0) {
+		JANUS_LOG(LOG_ERR, "[Opus] Ops! got an error decoding the Opus frame: %d (%s)\n", ss->pcm_length, opus_strerror(ss->pcm_length));
+		return;
+	}
+	int error = 0;
+	if (0 > pa_simple_write(ss->pa_s, ss->pcm_data, (size_t)(ss->pcm_length << 2), &error)) {
+		JANUS_LOG(LOG_ERR, "[Pulse] Ops! got an error playing the audio frame: %d (%s)\n", error, pa_strerror(error));
+		return;
+	}
+#endif
 	/* FIXME We don't care about what the browser sends us, we're sendonly */
 }
 
@@ -3634,6 +3709,12 @@ done:
 						mp->codecs.audio_pt, mp->codecs.audio_fmtp);
 					g_strlcat(sdptemp, buffer, 2048);
 				}
+#ifdef HAVE_LIBPULSE
+				if((mp->streaming_source == janus_streaming_source_rtp) &&
+					(((janus_streaming_rtp_source*)mp->source)->play_audio)) {
+					g_strlcat(sdptemp, "a=sendrecv\r\n", 2048);
+				} else
+#endif
 				g_strlcat(sdptemp, "a=sendonly\r\n", 2048);
 			}
 			if(mp->codecs.video_pt >= 0 && session->video) {
@@ -4045,6 +4126,20 @@ static void janus_streaming_rtp_source_free(janus_streaming_rtp_source *source) 
 	if(source->pipefd[1] > -1) {
 		close(source->pipefd[1]);
 	}
+#ifdef HAVE_LIBPULSE
+	if(source->pa_s) {
+		pa_simple_free(source->pa_s);
+	}
+	if(source->pa_sink) {
+		g_free(source->pa_sink);
+	}
+	if(source->pcm_data) {
+		g_free(source->pcm_data);
+	}
+	if(source->opus_decoder) {
+		opus_decoder_destroy(source->opus_decoder);
+	}
+#endif
 	janus_mutex_lock(&source->keyframe.mutex);
 	GList *temp = NULL;
 	while(source->keyframe.latest_keyframe) {
@@ -4871,7 +4966,11 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 		gboolean doaudio, char *artpmap, char *afmtp,
 		gboolean dovideo, char *vrtpmap, char *vfmtp,
 		const janus_network_address *iface,
+#ifdef HAVE_LIBPULSE
+		gboolean error_on_failure, char *pa_sink) {
+#else
 		gboolean error_on_failure) {
+#endif
 	if(url == NULL) {
 		JANUS_LOG(LOG_ERR, "Can't add 'rtsp' stream, missing url...\n");
 		return NULL;
@@ -4944,6 +5043,33 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 	live_rtsp->listeners = NULL;
 	g_atomic_int_set(&live_rtsp->destroyed, 0);
 	janus_refcount_init(&live_rtsp->ref, janus_streaming_mountpoint_free);
+#ifdef HAVE_LIBPULSE
+	if (pa_sink) {
+		live_rtsp_source->play_audio = TRUE;
+		if (pa_sink && (!strcmp(pa_sink, "null")))
+		  live_rtsp_source->pa_sink = NULL;
+		else
+			live_rtsp_source->pa_sink = pa_sink ? g_strdup(pa_sink) : NULL;
+		{
+			/* XXX TODO init pulse audio _after_ we learn the sample rate from the peer */
+			pa_sample_spec pa_ss;
+			pa_ss.format = PA_SAMPLE_S16NE;
+			pa_ss.channels = 2;
+			pa_ss.rate = 48000;
+			live_rtsp_source->pa_s = pa_simple_new(NULL, JANUS_STREAMING_NAME,
+				PA_STREAM_PLAYBACK, live_rtsp_source->pa_sink, "Voice", &pa_ss, NULL, NULL, NULL);
+
+			live_rtsp_source->pcm_data = g_malloc0(BUFFER_SAMPLES * sizeof(opus_int16));
+
+			int error = 0;
+			live_rtsp_source->opus_decoder = opus_decoder_create(pa_ss.rate, 2, &error);
+
+			if(error != OPUS_OK) {
+				JANUS_LOG(LOG_ERR, "Error creating Opus decoder %d (%s)\n", error, opus_strerror(error));
+			}
+		}
+	}
+#endif
 	janus_mutex_init(&live_rtsp->mutex);
 	/* We may have to override the rtpmap and/or fmtp for audio and/or video */
 	live_rtsp->codecs.audio_rtpmap = doaudio ? (artpmap ? g_strdup(artpmap) : NULL) : NULL;
