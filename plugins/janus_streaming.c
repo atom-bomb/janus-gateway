@@ -466,6 +466,7 @@ rtspiface = network interface IP address or device name to listen on when receiv
 	"offer_audio" : <true|false; whether or not audio should be negotiated; true by default if the mountpoint has audio>,
 	"offer_video" : <true|false; whether or not video should be negotiated; true by default if the mountpoint has video>,
 	"offer_data" : <true|false; whether or not datachannels should be negotiated; true by default if the mountpoint has datachannels>
+	"rtcp_keepalive" : <true|false; whether or not the session should be kept alive by incoming RTCP packets from the listener; false by default>
 }
 \endverbatim
  *
@@ -664,6 +665,8 @@ rtspiface = network interface IP address or device name to listen on when receiv
 #include "../record.h"
 #include "../utils.h"
 #include "../ip-utils.h"
+#include "../janus.h"
+#include "../ice.h"
 
 
 /* Plugin information */
@@ -738,7 +741,8 @@ static struct janus_json_parameter watch_parameters[] = {
 	{"offer_audio", JANUS_JSON_BOOL, 0},
 	{"offer_video", JANUS_JSON_BOOL, 0},
 	{"offer_data", JANUS_JSON_BOOL, 0},
-	{"restart", JANUS_JSON_BOOL, 0}
+	{"restart", JANUS_JSON_BOOL, 0},
+	{"rtcp_keepalive", JANUS_JSON_BOOL, 0},
 };
 static struct janus_json_parameter adminkey_parameters[] = {
 	{"admin_key", JSON_STRING, JANUS_JSON_PARAM_REQUIRED}
@@ -1071,6 +1075,7 @@ typedef struct janus_streaming_session {
 	gboolean stopping;
 	volatile gint hangingup;
 	volatile gint destroyed;
+	gboolean rtcp_keepalive; /* keep session alive with incoming RTCP packets */
 	janus_refcount ref;
 } janus_streaming_session;
 static GHashTable *sessions;
@@ -3460,6 +3465,16 @@ void janus_streaming_incoming_rtcp(janus_plugin_session *handle, int video, char
 	janus_streaming_session *session = (janus_streaming_session *)handle->plugin_handle;
 	if(!session || g_atomic_int_get(&session->destroyed) || session->stopping || !session->started || session->paused)
 		return;
+	if(session->rtcp_keepalive) {
+    /* circumvent janus opaque types to keep the session alive as long
+     * as there is RTCP feedback coming from the peer
+     */
+    janus_ice_handle *ice_handle = (janus_ice_handle*)handle->gateway_handle;
+		janus_session *gw_session = (janus_session*)ice_handle->session;
+		gw_session->last_activity = janus_get_monotonic_time();
+		JANUS_LOG(LOG_VERB, "rtcp_keepalive session %"SCNu64"\n", gw_session->session_id);
+	}
+
 	janus_streaming_mountpoint *mp = (janus_streaming_mountpoint *)session->mountpoint;
 	if(mp->streaming_source != janus_streaming_source_rtp)
 		return;
@@ -3597,6 +3612,8 @@ static void *janus_streaming_handler(void *data) {
 			guint64 id_value = json_integer_value(id);
 			json_t *restart = json_object_get(root, "restart");
 			do_restart = restart ? json_is_true(restart) : FALSE;
+			json_t *rtcp_keepalive = json_object_get(root, "rtcp_keepalive");
+			session->rtcp_keepalive = rtcp_keepalive ? json_is_true(rtcp_keepalive) : FALSE;
 			janus_mutex_lock(&mountpoints_mutex);
 			janus_streaming_mountpoint *mp = g_hash_table_lookup(mountpoints, &id_value);
 			if(mp == NULL) {
