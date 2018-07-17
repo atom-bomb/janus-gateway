@@ -455,7 +455,8 @@ rtspiface = network interface IP address or device name to listen on when receiv
  * To subscribe to a specific mountpoint, an interested viewer can make
  * use of the \c watch request. As suggested by the request name, this
  * instructs the plugin to setup a new PeerConnection to allow the new
- * viewer to watch the specified mountpoint. The \c watch request must
+ * viewer to watch the specified mountpoint. The viewer MAY include
+ * an SDP offer with the \c watch request. The \c watch request must
  * be formatted like this:
  *
 \verbatim
@@ -483,7 +484,8 @@ rtspiface = network interface IP address or device name to listen on when receiv
  * they can use those properties to shape the SDP offer to their needs.
  *
  * As anticipated, if successful this request will generate a new JSEP SDP
- * offer, which will be attached to a \c preparing status event:
+ * offer (or answer, if an offer was included in the \c watch request), which
+ * will be attached to a \c preparing status event:
  *
 \verbatim
 {
@@ -664,6 +666,7 @@ rtspiface = network interface IP address or device name to listen on when receiv
 #include "../record.h"
 #include "../utils.h"
 #include "../ip-utils.h"
+#include "../sdp-utils.h"
 
 
 /* Plugin information */
@@ -1062,6 +1065,8 @@ typedef struct janus_streaming_session {
 	gboolean paused;
 	gboolean audio, video, data;		/* Whether audio, video and/or data must be sent to this listener */
 	janus_rtp_switching_context context;
+	gint remote_audio_pt;	/* which audio payload type is expected by the listener */
+	gint remote_video_pt;	/* which video payload type is expected by the listener */
 	int substream;			/* Which simulcast substream we should forward, in case the mountpoint is simulcasting */
 	int substream_target;	/* As above, but to handle transitions (e.g., wait for keyframe) */
 	int templayer;			/* Which simulcast temporal layer we should forward, in case the mountpoint is simulcasting */
@@ -3539,6 +3544,8 @@ static void *janus_streaming_handler(void *data) {
 	int error_code = 0;
 	char error_cause[512];
 	json_t *root = NULL;
+	const char* msg_sdp_type;
+	const char* msg_sdp;
 	while(g_atomic_int_get(&initialized) && !g_atomic_int_get(&stopping)) {
 		msg = g_async_queue_pop(messages);
 		if(msg == &exit_message)
@@ -3639,6 +3646,7 @@ static void *janus_streaming_handler(void *data) {
 					goto done;
 				}
 			}
+
 			/* New viewer: we send an offer ourselves */
 			JANUS_LOG(LOG_VERB, "Request to watch mountpoint/stream %"SCNu64"\n", id_value);
 			if(session->mountpoint != NULL || g_list_find(mp->listeners, session) != NULL) {
@@ -3725,6 +3733,164 @@ static void *janus_streaming_handler(void *data) {
 					}
 				}
 			}
+
+			/* contrary to the original API, the watch request may or may not
+			 * contain a jsep offer
+			 */
+			if(msg->jsep) {
+				msg_sdp_type = json_string_value(json_object_get(msg->jsep, "type"));
+				msg_sdp = json_string_value(json_object_get(msg->jsep, "sdp"));
+
+				if(msg_sdp && !strcasecmp(msg_sdp_type, "offer")) {
+					JANUS_LOG(LOG_VERB, "Offer to watch mountpoint/stream %"SCNu64"\n", id_value);
+					char error_str[512];
+					janus_sdp *offer = janus_sdp_parse(msg_sdp, error_str, sizeof(error_str));
+
+					if(offer == NULL) {
+						janus_mutex_unlock(&mp->mutex);
+						janus_refcount_decrease(&mp->ref);
+						JANUS_LOG(LOG_ERR, "Error parsing offer: %s\n", error_str);
+						error_code = JANUS_STREAMING_ERROR_INVALID_REQUEST;
+						g_snprintf(error_cause, 512, "Error parsing offer: %s", error_str);
+						goto error;
+					} /* if */
+
+					/* handle a/v, audio-only or video-only mountpoints
+					 * XXX TODO data
+					 */
+					janus_sdp_mdirection audio_direction = JANUS_SDP_SENDONLY;
+					char* audio_codec = NULL;
+					char* video_codec = NULL;
+					char* slash = NULL;
+					janus_sdp *answer = NULL;
+
+					if(session->audio) {
+						audio_codec = g_strdup(mp->codecs.audio_rtpmap);
+
+#ifdef HAVE_LIBPULSE
+						if((mp->streaming_source == janus_streaming_source_rtp) &&
+							(((janus_streaming_rtp_source*)mp->source)->play_audio)) {
+							audio_direction = JANUS_SDP_SENDRECV;
+						}
+#endif
+						slash = strchr(audio_codec, '/');
+						if(slash)
+							*slash = '\0';
+					}
+
+					if(session->video) {
+						video_codec = g_strdup(mp->codecs.video_rtpmap);
+
+						slash = strchr(video_codec, '/');
+						if(slash)
+							*slash = '\0';
+					}
+
+					sdp_type = "answer";
+
+					if (session->audio && session->video) {
+						answer = janus_sdp_generate_answer(offer,
+							JANUS_SDP_OA_AUDIO_CODEC, audio_codec,
+							JANUS_SDP_OA_AUDIO_DIRECTION, audio_direction,
+							JANUS_SDP_OA_VIDEO_CODEC, video_codec,
+							JANUS_SDP_OA_VIDEO_DIRECTION, JANUS_SDP_SENDONLY,
+							JANUS_SDP_OA_VIDEO_RTCPFB_DEFAULTS, TRUE,
+							JANUS_SDP_OA_VIDEO_H264_FMTP, FALSE,
+							JANUS_SDP_OA_DONE);
+					} else if (session->audio) {
+						answer = janus_sdp_generate_answer(offer,
+							JANUS_SDP_OA_AUDIO_CODEC, audio_codec,
+							JANUS_SDP_OA_AUDIO_DIRECTION, audio_direction,
+							JANUS_SDP_OA_DONE);
+					} else {
+						answer = janus_sdp_generate_answer(offer,
+							JANUS_SDP_OA_VIDEO_CODEC, video_codec,
+							JANUS_SDP_OA_VIDEO_DIRECTION, JANUS_SDP_SENDONLY,
+							JANUS_SDP_OA_VIDEO_RTCPFB_DEFAULTS, TRUE,
+							JANUS_SDP_OA_VIDEO_H264_FMTP, FALSE,
+							JANUS_SDP_OA_DONE);
+					}
+
+					janus_sdp_destroy(offer);
+
+					/* this should never happen */
+					if(NULL == answer)
+						session->audio = session->video = FALSE;
+
+					if(session->audio) {
+						janus_sdp_mline *m = janus_sdp_mline_find(answer, JANUS_SDP_AUDIO);
+
+						if(m == NULL) {
+							session->audio = FALSE;
+						} else {
+							/* peers expect RTP streams to be tagged with the payload type
+							 * given in the offer. keep track of that payload type here
+							 * so the streams can be re-tagged before relaying to
+							 * each this listener.
+							 */
+							session->remote_audio_pt = janus_sdp_get_codec_pt(answer, audio_codec);
+							if(mp->codecs.audio_fmtp) {
+								/* fiddle fmtp line to match pt of offer */
+								janus_sdp_attribute *a = janus_sdp_attribute_create("fmtp",
+									"%d %s", session->remote_audio_pt,
+									mp->codecs.audio_fmtp);
+								janus_sdp_attribute_add_to_mline(m, a);
+							}
+						}
+						free(audio_codec);
+					}
+					if(session->video) {
+						janus_sdp_mline *m = janus_sdp_mline_find(answer, JANUS_SDP_VIDEO);
+
+						if(m == NULL) {
+							session->video = FALSE;
+						} else {
+							/* peers expect RTP streams to be tagged with the payload type
+							 * given in the offer. keep track of that payload type here
+							 * so the streams can be re-tagged before relaying to
+							 * each this listener.
+							 */
+							session->remote_video_pt = janus_sdp_get_codec_pt(answer, video_codec);
+							if(mp->codecs.video_fmtp) {
+								/* fiddle fmtp line to match pt of offer */
+								janus_sdp_attribute *a = janus_sdp_attribute_create("fmtp",
+									"%d %s", session->remote_video_pt,
+									mp->codecs.video_fmtp);
+								janus_sdp_attribute_add_to_mline(m, a);
+							}
+						}
+						free(video_codec);
+					}
+
+					/* if no streams were negotiable, error out */
+					if((session->video == FALSE) && (session->audio == FALSE)) {
+						session->stopping = TRUE;
+						session->mountpoint = NULL;
+						if(answer)
+							janus_sdp_destroy(answer);
+						janus_mutex_unlock(&mp->mutex);
+						janus_refcount_decrease(&mp->ref);
+
+						JANUS_LOG(LOG_ERR, "Failed to negotiate audio or video\n");
+						error_code = JANUS_STREAMING_ERROR_INVALID_REQUEST;
+						g_snprintf(error_cause, 512, "Failed to negotiate audio or video");
+						goto error;
+					}
+
+					/* Replace the session name */
+					g_free(answer->s_name);
+					char s_name[100];
+					g_snprintf(s_name, sizeof(s_name),
+						"Mountpoint %"SCNu64, mp->id);
+					answer->s_name = g_strdup(s_name);
+
+					sdp = janus_sdp_write(answer);
+					janus_sdp_destroy(answer);
+
+					janus_refcount_increase(&session->ref);
+					session->paused = FALSE;
+				} /* if jsep has an offer */
+			} else { /* jsep */
 			janus_refcount_increase(&session->ref);
 done:
 			/* Let's prepare an offer now, but let's also check if there's something we need to skip */
@@ -3806,6 +3972,7 @@ done:
 			}
 #endif
 			sdp = g_strdup(sdptemp);
+			} /* else */
 			JANUS_LOG(LOG_VERB, "Going to %s this SDP:\n%s\n", sdp_type, sdp);
 			result = json_object();
 			json_object_set_new(result, "status", json_string(do_restart ? "updating" : "preparing"));
@@ -4015,8 +4182,8 @@ done:
 		}
 
 		/* Any SDP to handle? */
-		const char *msg_sdp_type = json_string_value(json_object_get(msg->jsep, "type"));
-		const char *msg_sdp = json_string_value(json_object_get(msg->jsep, "sdp"));
+		msg_sdp_type = json_string_value(json_object_get(msg->jsep, "type"));
+		msg_sdp = json_string_value(json_object_get(msg->jsep, "sdp"));
 		if(msg_sdp) {
 			JANUS_LOG(LOG_VERB, "This is involving a negotiation (%s) as well (%s):\n%s\n",
 				do_restart ? "renegotiation occurring" : "but we really don't care", msg_sdp_type, msg_sdp);
@@ -6192,6 +6359,10 @@ static void janus_streaming_relay_rtp_packet(gpointer data, gpointer user_data) 
 					}
 					/* If we got here, update the RTP header and send the packet */
 					janus_rtp_header_update(packet->data, &session->context, TRUE, 0);
+					if(session->remote_video_pt) {
+						janus_rtp_header* the_header = (janus_rtp_header*)packet->data;
+						the_header->type = session->remote_video_pt;
+					}
 					memcpy(vp8pd, payload, sizeof(vp8pd));
 					janus_vp8_simulcast_descriptor_update(payload, plen, &session->simulcast_context, switched);
 				}
@@ -6208,6 +6379,10 @@ static void janus_streaming_relay_rtp_packet(gpointer data, gpointer user_data) 
 			} else {
 				/* Fix sequence number and timestamp (switching may be involved) */
 				janus_rtp_header_update(packet->data, &session->context, TRUE, 0);
+				if(session->remote_video_pt) {
+					janus_rtp_header* the_header = (janus_rtp_header*)packet->data;
+					the_header->type = session->remote_video_pt;
+				}
 				if(gateway != NULL)
 					gateway->relay_rtp(session->handle, packet->is_video, (char *)packet->data, packet->length);
 				/* Restore the timestamp and sequence number to what the publisher set them to */
@@ -6219,6 +6394,10 @@ static void janus_streaming_relay_rtp_packet(gpointer data, gpointer user_data) 
 				return;
 			/* Fix sequence number and timestamp (switching may be involved) */
 			janus_rtp_header_update(packet->data, &session->context, FALSE, 0);
+			if(session->remote_audio_pt) {
+				janus_rtp_header* the_header = (janus_rtp_header*)packet->data;
+				the_header->type = session->remote_audio_pt;
+			}
 			if(gateway != NULL)
 				gateway->relay_rtp(session->handle, packet->is_video, (char *)packet->data, packet->length);
 			/* Restore the timestamp and sequence number to what the publisher set them to */
