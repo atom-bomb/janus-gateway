@@ -1,4 +1,4 @@
-AC_INIT([Janus Gateway],[0.4.3],[https://github.com/meetecho/janus-gateway],[janus-gateway],[https://janus.conf.meetecho.com])
+AC_INIT([Janus Gateway],[0.4.4],[https://github.com/meetecho/janus-gateway],[janus-gateway],[https://janus.conf.meetecho.com])
 AC_CONFIG_AUX_DIR([.])
 AC_CONFIG_MACRO_DIR([m4])
 
@@ -15,9 +15,9 @@ AC_PROG_CC
 LT_PREREQ([2.2])
 LT_INIT
 
-JANUS_VERSION=43
+JANUS_VERSION=44
 AC_SUBST(JANUS_VERSION)
-JANUS_VERSION_STRING="0.4.3"
+JANUS_VERSION_STRING="0.4.4"
 AC_SUBST(JANUS_VERSION_STRING)
 
 case "$host_os" in
@@ -540,11 +540,11 @@ AC_ARG_ENABLE([plugin-audiobridge],
               [enable_plugin_audiobridge=maybe])
 
 AC_ARG_ENABLE([plugin-duktape],
-              [AS_HELP_STRING([--disable-plugin-duktape],
-                              [Disable duktape plugin])],
+              [AS_HELP_STRING([--enable-plugin-duktape],
+                              [Enable duktape plugin])],
               [AS_IF([test "x$enable_plugin_duktape" != "xyes"],
                      [enable_plugin_duktape=no])],
-              [enable_plugin_duktape=yes])
+              [enable_plugin_duktape=no])
 
 AC_ARG_ENABLE([plugin-echotest],
               [AS_HELP_STRING([--disable-plugin-echotest],
@@ -554,11 +554,11 @@ AC_ARG_ENABLE([plugin-echotest],
               [enable_plugin_echotest=yes])
 
 AC_ARG_ENABLE([plugin-lua],
-              [AS_HELP_STRING([--disable-plugin-lua],
-                              [Disable lua plugin])],
+              [AS_HELP_STRING([--enable-plugin-lua],
+                              [Enable lua plugin])],
               [AS_IF([test "x$enable_plugin_lua" != "xyes"],
                      [enable_plugin_lua=no])],
-              [enable_plugin_lua=yes])
+              [enable_plugin_lua=no])
 
 AC_ARG_ENABLE([plugin-recordplay],
               [AS_HELP_STRING([--disable-plugin-recordplay],
