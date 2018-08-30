@@ -990,6 +990,13 @@ typedef struct janus_streaming_rtp_source {
 	gint64 pli_latest;			/* Time of latest sent PLI (to avoid flooding) */
 	uint32_t lowest_bitrate;	/* Lowest bitrate received by viewers via REMB since last update */
 	gint64 remb_latest;			/* Time of latest sent REMB (to avoid flooding) */
+	uint32_t rr_count;	/* number of RR messages received */
+	uint32_t highest_loss_count;	/* highest loss count received by viewers via RR since last update */
+	int highest_loss_fraction;	/* highest loss fraction received by viewers via RR since last update */
+	uint32_t highest_jitter;	/* highest jitter received by viewers via RR since last update */
+	uint32_t last_ehsnr;	/* last extended highest sequence number received by viewers via RR */
+	uint32_t last_lsr;	/* last SR sequence number received by viewers via RR */
+	uint32_t last_delay;	/* last delay since last SR received by viewers via RR */
 	struct sockaddr audio_rtcp_addr, video_rtcp_addr;
 #ifdef HAVE_LIBCURL
 	gboolean rtsp;
@@ -1055,6 +1062,7 @@ typedef struct janus_streaming_mountpoint {
 	GDestroyNotify source_destroy;
 	janus_streaming_codecs codecs;
 	gboolean audio, video, data;
+	int num_viewers;
 	GList *viewers;
 	int helper_threads;		/* Only relevant for RTP mountpoints */
 	GList *threads;			/* Only relevant for RTP mountpoints */
@@ -1285,6 +1293,36 @@ static void janus_streaming_rtcp_remb_send(janus_streaming_rtp_source *source) {
 	} else {
 		JANUS_LOG(LOG_HUGE, "Sent %d/%d bytes\n", sent, rtcp_len);
 	}
+}
+
+/* Helper method to send an RTCP RR */
+static void janus_streaming_rtcp_rr_send(janus_streaming_rtp_source *source) {
+	if(source == NULL || source->video_rtcp_fd < 0 || source->video_rtcp_addr.sa_family == 0)
+		return;
+	JANUS_LOG(LOG_HUGE, "Sending RR\n");
+	/* Generate a RR */
+	janus_rtcp_rr rr;
+	rr.header.version = 2;
+	rr.header.type = RTCP_RR;
+	rr.header.rc = 1;
+	rr.ssrc = htonl(source->video_ssrc);
+	rr.rb[0].ssrc = htonl(source->video_ssrc);
+	rr.rb[0].flcnpl = htonl((source->highest_loss_fraction << 24) | source->highest_loss_count);
+	rr.rb[0].ehsnr = htonl(source->last_ehsnr);
+	rr.rb[0].jitter = htonl(source->highest_jitter);
+	rr.rb[0].lsr = htonl(source->last_lsr);
+	rr.rb[0].delay = htonl(source->last_delay);
+	/* Send the packet */
+	int sent = 0;
+	if((sent = sendto(source->video_rtcp_fd, &rr, sizeof(rr), 0,
+			&source->video_rtcp_addr, sizeof(source->video_rtcp_addr))) < 0) {
+		JANUS_LOG(LOG_ERR, "Error in sendto... %d (%s)\n", errno, strerror(errno));
+	} else {
+		JANUS_LOG(LOG_HUGE, "Sent %d/%d bytes\n", sent, sizeof(rr));
+	}
+	source->highest_loss_count = 0;
+	source->highest_loss_fraction = 0;
+	source->highest_jitter = 0;
 }
 
 
@@ -3167,6 +3205,7 @@ struct janus_plugin_result *janus_streaming_handle_message(janus_plugin_session 
 			}
 			mp->viewers = g_list_remove_all(mp->viewers, session);
 			viewer = g_list_first(mp->viewers);
+			mp->num_viewers = 0;
 		}
 		json_decref(event);
 		janus_mutex_unlock(&mp->mutex);
@@ -3607,6 +3646,44 @@ void janus_streaming_incoming_rtcp(janus_plugin_session *handle, int video, char
 	} else if(video && (source->video_rtcp_fd > -1) && (source->video_rtcp_addr.sa_family != 0)) {
 		JANUS_LOG(LOG_HUGE, "Got video RTCP feedback from a viewer: SSRC %"SCNu32"\n",
 			janus_rtcp_get_sender_ssrc(buf, len));
+		/* parse everything out of any incoming RR */
+		{
+			janus_rtcp_header *rtcp = (janus_rtcp_header*)buf;
+			int total = len;
+			if(buf == NULL || len == 0 || (rtcp->version != 2))
+				return;
+			while(rtcp) {
+				if(RTCP_RR == rtcp->type) {
+					janus_rtcp_rr *rr = (janus_rtcp_rr*)rtcp;
+					uint32_t loss_count = ntohl(rr->rb[0].flcnpl) & 0xffffff ;
+					int loss_fraction = ntohl(rr->rb[0].flcnpl) >> 24;
+					uint32_t jitter = ntohl(rr->rb[0].jitter);
+					source->last_ehsnr = ntohl(rr->rb[0].ehsnr);
+					source->last_lsr = ntohl(rr->rb[0].lsr);
+					source->last_delay = ntohl(rr->rb[0].delay);
+					JANUS_LOG(LOG_HUGE, "  -- RR for this PeerConnection: %"SCNu32", %d\n", loss_count, loss_fraction);
+					if(loss_count > source->highest_loss_count)
+						source->highest_loss_count = loss_count;
+					if(loss_fraction > source->highest_loss_fraction)
+						source->highest_loss_fraction = loss_fraction;
+					if(jitter > source->highest_jitter)
+						source->highest_jitter = jitter;
+					/* assuming RR is sent at roughly the same rate by all viewers, send an RR
+					 * once all viewers (may) have sent reports
+					 */
+					if(mp->num_viewers && (++source->rr_count % mp->num_viewers == 0))
+						janus_streaming_rtcp_rr_send(source);
+					break;
+				}
+				int length = ntohs(rtcp->length);
+				if(length == 0)
+					break;
+				total -= length*4+4;
+				if(total <= 0)
+					break;
+				rtcp = (janus_rtcp_header *)((uint32_t*)rtcp + length + 1);
+			}
+		}
 		/* We only relay PLI/FIR and REMB packets, but in a selective way */
 		if(janus_rtcp_has_fir(buf, len) || janus_rtcp_has_pli(buf, len)) {
 			/* We got a PLI/FIR, pass it along unless we just sent one */
@@ -3665,6 +3742,7 @@ static void janus_streaming_hangup_media_internal(janus_plugin_session *handle) 
 			janus_refcount_decrease(&session->ref);
 		}
 		mp->viewers = g_list_remove_all(mp->viewers, session);
+		mp->num_viewers = g_list_length(mp->viewers);
 		if(mp->streaming_source == janus_streaming_source_rtp) {
 			/* Remove the viewer from the helper threads too, if any */
 			if(mp->helper_threads > 0) {
@@ -3996,6 +4074,7 @@ done:
 			json_object_set_new(result, "status", json_string(do_restart ? "updating" : "preparing"));
 			/* Add the user to the list of watchers and we're done */
 			mp->viewers = g_list_append(mp->viewers, session);
+			mp->num_viewers++;
 			if(mp->streaming_source == janus_streaming_source_rtp) {
 				/* If we're using helper threads, add the viewer to one of those */
 				if(mp->helper_threads > 0) {
@@ -4216,6 +4295,7 @@ done:
 			/* Unsubscribe from the previous mountpoint and subscribe to the new one */
 			janus_mutex_lock(&oldmp->mutex);
 			oldmp->viewers = g_list_remove_all(oldmp->viewers, session);
+			oldmp->num_viewers = 0;
 			/* Remove the viewer from the helper threads too, if any */
 			if(mp->helper_threads > 0) {
 				GList *l = mp->threads;
@@ -4237,6 +4317,7 @@ done:
 			/* Subscribe to the new one */
 			janus_mutex_lock(&mp->mutex);
 			mp->viewers = g_list_append(mp->viewers, session);
+			mp->num_viewers++;
 			/* If we're using helper threads, add the viewer to one of those */
 			if(mp->helper_threads > 0) {
 				int viewers = 0;
@@ -4831,6 +4912,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtp_source(
 	live_rtp->codecs.video_rtpmap = dovideo ? g_strdup(vrtpmap) : NULL;
 	live_rtp->codecs.video_fmtp = dovideo ? (vfmtp ? g_strdup(vfmtp) : NULL) : NULL;
 	live_rtp->viewers = NULL;
+	live_rtp->num_viewers = 0;
 	g_atomic_int_set(&live_rtp->destroyed, 0);
 	janus_refcount_init(&live_rtp->ref, janus_streaming_mountpoint_free);
 	janus_mutex_init(&live_rtp->mutex);
@@ -4944,6 +5026,7 @@ janus_streaming_mountpoint *janus_streaming_create_file_source(
 	file_source->codecs.video_pt = -1;	/* FIXME We don't support video for this type yet */
 	file_source->codecs.video_rtpmap = NULL;
 	file_source->viewers = NULL;
+	file_source->num_viewers = 0;
 	g_atomic_int_set(&file_source->destroyed, 0);
 	janus_refcount_init(&file_source->ref, janus_streaming_mountpoint_free);
 	janus_mutex_init(&file_source->mutex);
@@ -5444,6 +5527,7 @@ janus_streaming_mountpoint *janus_streaming_create_rtsp_source(
 	live_rtsp->source = live_rtsp_source;
 	live_rtsp->source_destroy = (GDestroyNotify) janus_streaming_rtp_source_free;
 	live_rtsp->viewers = NULL;
+	live_rtsp->num_viewers = 0;
 	g_atomic_int_set(&live_rtsp->destroyed, 0);
 	janus_refcount_init(&live_rtsp->ref, janus_streaming_mountpoint_free);
 	janus_mutex_init(&live_rtsp->mutex);
@@ -6387,6 +6471,7 @@ static void *janus_streaming_relay_thread(void *data) {
 			janus_refcount_decrease(&mountpoint->ref);
 		}
 		mountpoint->viewers = g_list_remove_all(mountpoint->viewers, session);
+		mountpoint->num_viewers--;
 		viewer = g_list_first(mountpoint->viewers);
 	}
 	json_decref(event);
