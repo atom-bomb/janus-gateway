@@ -29,6 +29,8 @@
 #include "refcount.h"
 #include "plugins/plugin.h"
 
+/* use separate threads for sending and receiving to avoid deadlock */
+#define ICE_SEND_IN_SECOND_THREAD 1
 
 /*! \brief ICE stuff initialization
  * @param[in] ice_lite Whether the ICE Lite mode should be enabled or not
@@ -269,6 +271,14 @@ struct janus_ice_handle {
 	GMainLoop *iceloop;
 	/*! \brief GLib thread for libnice */
 	GThread *icethread;
+#ifdef ICE_SEND_IN_SECOND_THREAD
+	/*! \brief GLib context for libnice send */
+	GMainContext *icesendctx;
+	/*! \brief GLib loop for libnice send */
+	GMainLoop *icesendloop;
+	/*! \brief GLib thread for libnice */
+	GThread *icesendthread;
+#endif /* ICE_SEND_IN_SECOND_THREAD */
 	/*! \brief GLib sources for outgoing traffic, recurring RTCP, and stats */
 	GSource *rtp_source, *rtcp_source, *stats_source;
 	/*! \brief Atomic flag to check if the ICE loop is still running */
