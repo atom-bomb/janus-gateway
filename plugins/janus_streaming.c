@@ -5845,10 +5845,13 @@ static void *janus_streaming_relay_thread(void *data) {
 				continue;
 			}
 			now = janus_get_monotonic_time();
-			if(!source->reconnecting && (now - source->reconnect_timer > 5*G_USEC_PER_SEC)) {
+			if(!source->reconnecting &&
+				(now - source->reconnect_timer > 5*G_USEC_PER_SEC) &&
+				(((audio_fd != -1) && (now - source->last_received_audio > 5*G_USEC_PER_SEC)) ||
+				((video_fd[0] != -1) && (now - source->last_received_video > 5*G_USEC_PER_SEC)))) {
 				/* 5 seconds passed and no media? Assume the RTSP server has gone and schedule a reconnect */
-				JANUS_LOG(LOG_WARN, "[%s] %"SCNi64"s passed with no media, trying to reconnect the RTSP stream\n",
-					name, (now - source->reconnect_timer)/G_USEC_PER_SEC);
+				JANUS_LOG(LOG_WARN, "[%s] >5s passed with no media, trying to reconnect the RTSP stream\n",
+					name);
 				audio_fd = -1;
 				video_fd[0] = -1;
 				video_fd[1] = -1;
@@ -6038,9 +6041,6 @@ static void *janus_streaming_relay_thread(void *data) {
 					if(mountpoint->active == FALSE)
 						mountpoint->active = TRUE;
 					gint64 now = janus_get_monotonic_time();
-#ifdef HAVE_LIBCURL
-					source->reconnect_timer = now;
-#endif
 					addrlen = sizeof(remote);
 					bytes = recvfrom(audio_fd, buffer, 1500, 0, &remote, &addrlen);
 					if(bytes < 0) {
@@ -6127,9 +6127,6 @@ static void *janus_streaming_relay_thread(void *data) {
 					if(mountpoint->active == FALSE)
 						mountpoint->active = TRUE;
 					gint64 now = janus_get_monotonic_time();
-#ifdef HAVE_LIBCURL
-					source->reconnect_timer = now;
-#endif
 					addrlen = sizeof(remote);
 					bytes = recvfrom(fds[i].fd, buffer, 1500, 0, &remote, &addrlen);
 					if(bytes < 0) {
@@ -6314,9 +6311,6 @@ static void *janus_streaming_relay_thread(void *data) {
 					if(mountpoint->active == FALSE)
 						mountpoint->active = TRUE;
 					source->last_received_data = janus_get_monotonic_time();
-#ifdef HAVE_LIBCURL
-					source->reconnect_timer = janus_get_monotonic_time();
-#endif
 					addrlen = sizeof(remote);
 					bytes = recvfrom(data_fd, buffer, 1500, 0, &remote, &addrlen);
 					if(bytes < 0) {
