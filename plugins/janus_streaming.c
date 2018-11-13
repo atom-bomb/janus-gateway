@@ -4491,8 +4491,10 @@ static void janus_streaming_rtp_source_free(janus_streaming_rtp_source *source) 
 	g_free(source->rtsp_url);
 	g_free(source->rtsp_username);
 	g_free(source->rtsp_password);
-	g_free(source->rtsp_ahost);
-	g_free(source->rtsp_vhost);
+	if (source->rtsp_ahost)
+		g_free(source->rtsp_ahost);
+	if (source->rtsp_vhost)
+		g_free(source->rtsp_vhost);
 	janus_mutex_unlock(&source->rtsp_mutex);
 #endif
 	g_free(source);
@@ -5292,14 +5294,20 @@ static int janus_streaming_rtsp_connect_to_server(janus_streaming_mountpoint *mp
 	source->audio_rtcp_fd = audio_fds.rtcp_fd;
 	source->remote_audio_port = asport;
 	source->remote_audio_rtcp_port = asport_rtcp;
-	g_free(source->rtsp_ahost);
+	if (source->rtsp_ahost) {
+		g_free(source->rtsp_ahost);
+		source->rtsp_ahost = NULL;
+	}
 	if(asport > 0)
 		source->rtsp_ahost = g_strdup(ahost);
 	source->video_fd[0] = video_fds.fd;
 	source->video_rtcp_fd = video_fds.rtcp_fd;
 	source->remote_video_port = vsport;
 	source->remote_video_rtcp_port = vsport_rtcp;
-	g_free(source->rtsp_vhost);
+	if (source->rtsp_vhost) {
+		g_free(source->rtsp_vhost);
+		source->rtsp_vhost = NULL;
+	}
 	if(vsport > 0)
 		source->rtsp_vhost = g_strdup(vhost);
 	source->curl = curl;
@@ -5847,8 +5855,8 @@ static void *janus_streaming_relay_thread(void *data) {
 			now = janus_get_monotonic_time();
 			if(!source->reconnecting &&
 				(now - source->reconnect_timer > 5*G_USEC_PER_SEC) &&
-				(((audio_fd != -1) && (now - source->last_received_audio > 5*G_USEC_PER_SEC)) ||
-				((video_fd[0] != -1) && (now - source->last_received_video > 5*G_USEC_PER_SEC)))) {
+				((mountpoint->audio && ((audio_fd == -1) || (now - source->last_received_audio > 5*G_USEC_PER_SEC))) ||
+				(mountpoint->video && ((video_fd[0] == -1) || (now - source->last_received_video > 5*G_USEC_PER_SEC))))) {
 				/* 5 seconds passed and no media? Assume the RTSP server has gone and schedule a reconnect */
 				JANUS_LOG(LOG_WARN, "[%s] >5s passed with no media, trying to reconnect the RTSP stream\n",
 					name);
